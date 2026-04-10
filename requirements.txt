@@ -1,0 +1,3 @@
+aiomqtt>=2.0.0
+# For RS-485 / RFC2217 serial connections (optional for WiFi-only use):
+# pyserial-asyncio>=0.6
