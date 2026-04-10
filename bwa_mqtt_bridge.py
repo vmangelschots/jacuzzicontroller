@@ -14,6 +14,7 @@ Environment variables:
     BWA_SPA_URI       — Spa URI (overrides positional arg)
     BWA_DEVICE_ID     — Homie device ID (default: bwa)
     BWA_ROOT_TOPIC    — Homie root topic (default: homie)
+    LOG_LEVEL         — Logging level: DEBUG, INFO, WARNING (default: WARNING)
 """
 
 from __future__ import annotations
@@ -775,6 +776,9 @@ async def main() -> None:
         level = logging.INFO
     elif args.verbose >= 2:
         level = logging.DEBUG
+    env_level = os.getenv("LOG_LEVEL", "").upper()
+    if env_level:
+        level = getattr(logging, env_level, level)
     logging.basicConfig(level=level, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
     mqtt_uri_str = args.mqtt_uri or os.getenv("BWA_MQTT_URI")
