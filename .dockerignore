@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+bwa/__pycache__/
+bwa/messages/__pycache__/
+*.pyc
+balboa_worldwide_app/
+CLAUDE.md
+.git/
