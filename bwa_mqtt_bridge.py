@@ -594,8 +594,25 @@ class MQTTBridge:
     # Main loop
     # ------------------------------------------------------------------
 
+    async def _connect_spa(self, retry_delay: int = 300) -> None:
+        """Connect (or reconnect) to the spa, retrying every *retry_delay* seconds on failure."""
+        spa = self.spa
+        while True:
+            try:
+                await spa.connect()
+                await spa.request_configuration()
+                await spa.request_filter_configuration()
+                return
+            except Exception as exc:
+                logger.error(
+                    "Failed to connect to spa: %s — retrying in %ds", exc, retry_delay
+                )
+                await asyncio.sleep(retry_delay)
+
     async def run(self) -> None:
         spa = self.spa
+
+        await self._connect_spa()
 
         # Wait for full configuration
         logger.info("Waiting for full spa configuration…")
@@ -634,11 +651,8 @@ class MQTTBridge:
             try:
                 message = await spa.poll()
             except ConnectionError as exc:
-                logger.error("Spa connection lost: %s — reconnecting in 10s", exc)
-                await asyncio.sleep(10)
-                await spa.connect()
-                await spa.request_configuration()
-                await spa.request_filter_configuration()
+                logger.error("Spa connection lost: %s", exc)
+                await self._connect_spa()
                 continue
 
             if isinstance(message, msgs.Status):
@@ -811,9 +825,6 @@ async def main() -> None:
 
     logger.info("Connecting to spa at %s", spa_uri_str)
     spa = BWAClient(spa_uri_str)
-    await spa.connect()
-    await spa.request_configuration()
-    await spa.request_filter_configuration()
 
     will = aiomqtt.Will(
         topic=f"{args.root_topic}/{args.device_id}/$state",
