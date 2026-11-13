@@ -15,6 +15,8 @@ Environment variables:
     BWA_DEVICE_ID     — Homie device ID (default: bwa)
     BWA_ROOT_TOPIC    — Homie root topic (default: homie)
     LOG_LEVEL         — Logging level: DEBUG, INFO, WARNING (default: WARNING)
+    BWA_HEARTBEAT_FILE — File touched on each spa status, for liveness probes
+                         (default: /dev/shm/bwa-heartbeat; empty disables)
 """
 
 from __future__ import annotations
@@ -39,7 +41,12 @@ from bwa import messages as msgs
 
 logger = logging.getLogger("bwa_mqtt_bridge")
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
+
+# Touched whenever a status arrives from the spa; a k8s liveness probe can
+# check its age. Empty string disables it.
+HEARTBEAT_FILE = os.getenv("BWA_HEARTBEAT_FILE", "/dev/shm/bwa-heartbeat")
+HEARTBEAT_INTERVAL = 10.0  # seconds between heartbeat writes
 
 # ---------------------------------------------------------------------------
 # Minimal Homie 4.0 device implementation
@@ -149,7 +156,13 @@ class HomieDevice:
         if prop is None or prop.on_set is None:
             return
         logger.debug("set %s/%s = %r", node_id, prop_id, payload)
-        prop.on_set(payload)
+        try:
+            prop.on_set(payload)
+        except Exception:  # noqa: BLE001 — a bad payload must not kill the bridge
+            logger.exception("Failed to handle set %s/%s = %r", node_id, prop_id, payload)
+
+    async def publish_state(self, state: str) -> None:
+        await self.publish(f"{self.base}/$state", state)
 
     # ------------------------------------------------------------------
     # Home Assistant discovery helpers
@@ -170,6 +183,12 @@ class HomieDevice:
                     "name": prop.name,
                     "unique_id": uid,
                     "device": device_info,
+                    # Entities go "unavailable" unless the bridge reports
+                    # $state=ready (covers LWT "lost" and spa outage "alert").
+                    "availability_topic": f"{self.base}/$state",
+                    "availability_template": (
+                        "{{ 'online' if value == 'ready' else 'offline' }}"
+                    ),
                 }
                 config.update(prop.hass_extra)
 
@@ -218,6 +237,35 @@ class HomieDevice:
                     retain=True,
                     qos=1,
                 )
+
+
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _spawn(coro) -> asyncio.Task:
+    """Run a command coroutine in the background, keeping a reference and
+    logging failures (bare create_task drops both)."""
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+
+    def _done(t: asyncio.Task) -> None:
+        _background_tasks.discard(t)
+        if not t.cancelled() and t.exception() is not None:
+            logger.error("Spa command failed: %r", t.exception())
+
+    task.add_done_callback(_done)
+    return task
+
+
+def _touch_heartbeat() -> None:
+    """Update the liveness-probe file (only called when spa data arrives)."""
+    if not HEARTBEAT_FILE:
+        return
+    try:
+        with open(HEARTBEAT_FILE, "w") as fh:
+            fh.write(str(time.time()))
+    except OSError as exc:
+        logger.debug("Could not write heartbeat file %s: %s", HEARTBEAT_FILE, exc)
 
 
 def _encode_value(value: Any, datatype: str) -> str:
@@ -296,7 +344,7 @@ class MQTTBridge:
                 "step": temp_step,
                 "icon": "mdi:thermometer",
             },
-            on_set=lambda v: asyncio.create_task(
+            on_set=lambda v: _spawn(
                 spa.set_target_temperature(float(v))
             ),
         ))
@@ -340,7 +388,7 @@ class MQTTBridge:
             format="ready,rest,ready_in_rest",
             hass_component="select",
             hass_extra={"icon": "mdi:cog-play"},
-            on_set=lambda v: asyncio.create_task(
+            on_set=lambda v: _spawn(
                 spa.set_heating_mode(v) if v != "toggle" else spa.toggle_heating_mode()
             ),
         ))
@@ -351,7 +399,7 @@ class MQTTBridge:
             format="high,low",
             hass_component="select",
             hass_extra={"icon": "mdi:thermometer-lines"},
-            on_set=lambda v: asyncio.create_task(
+            on_set=lambda v: _spawn(
                 spa.set_temperature_range(v) if v != "toggle" else spa.toggle_temperature_range()
             ),
         ))
@@ -361,7 +409,7 @@ class MQTTBridge:
             settable=True,
             format="fahrenheit,celsius",
             hass_component="select",
-            on_set=lambda v: asyncio.create_task(spa.set_temperature_scale(v)),
+            on_set=lambda v: _spawn(spa.set_temperature_scale(v)),
         ))
         spa_node.add(HomieProperty(
             "hold", "Hold", "boolean",
@@ -369,7 +417,7 @@ class MQTTBridge:
             settable=True,
             hass_component="switch",
             hass_extra={"icon": "mdi:pause-octagon"},
-            on_set=lambda v: asyncio.create_task(
+            on_set=lambda v: _spawn(
                 spa.toggle_hold() if v == "toggle" else spa.set_hold(v == "true")
             ),
         ))
@@ -391,7 +439,7 @@ class MQTTBridge:
             settable=True,
             hass_component="switch",
             hass_extra={"icon": "mdi:timer-cog"},
-            on_set=lambda v: asyncio.create_task(_set_time_format(spa, v == "true")),
+            on_set=lambda v: _spawn(_set_time_format(spa, v == "true")),
         ))
 
         # Circulation pump
@@ -411,7 +459,7 @@ class MQTTBridge:
                 settable=True,
                 hass_component="switch",
                 hass_extra={"icon": "mdi:chart-bubble"},
-                on_set=lambda v: asyncio.create_task(
+                on_set=lambda v: _spawn(
                     spa.toggle_blower() if v == "toggle"
                     else spa.set_blower(v == "true")
                 ),
@@ -424,7 +472,7 @@ class MQTTBridge:
                 format=f"0:{cfg.blower}",
                 hass_component="number",
                 hass_extra={"icon": "mdi:chart-bubble"},
-                on_set=lambda v: asyncio.create_task(
+                on_set=lambda v: _spawn(
                     spa.toggle_blower() if v == "toggle"
                     else spa.set_blower(int(v))
                 ),
@@ -438,7 +486,7 @@ class MQTTBridge:
                 settable=True,
                 hass_component="switch",
                 hass_extra={"icon": "mdi:sprinkler-fire"},
-                on_set=lambda v: asyncio.create_task(
+                on_set=lambda v: _spawn(
                     spa.toggle_mister() if v == "toggle"
                     else spa.set_mister(v == "true")
                 ),
@@ -459,7 +507,7 @@ class MQTTBridge:
                     settable=True,
                     hass_component="switch",
                     hass_extra={"icon": "mdi:chart-bubble"},
-                    on_set=lambda v, ix=idx: asyncio.create_task(
+                    on_set=lambda v, ix=idx: _spawn(
                         spa.toggle_pump(ix) if v == "toggle"
                         else spa.set_pump(ix, v == "true")
                     ),
@@ -472,7 +520,7 @@ class MQTTBridge:
                     format=f"0:{max_speed}",
                     hass_component="number",
                     hass_extra={"icon": "mdi:chart-bubble"},
-                    on_set=lambda v, ix=idx: asyncio.create_task(
+                    on_set=lambda v, ix=idx: _spawn(
                         spa.toggle_pump(ix) if v == "toggle"
                         else spa.set_pump(ix, int(v))
                     ),
@@ -492,7 +540,7 @@ class MQTTBridge:
                 settable=True,
                 hass_component="light",
                 hass_extra={"icon": "mdi:car-parking-lights"},
-                on_set=lambda v, ix=idx: asyncio.create_task(
+                on_set=lambda v, ix=idx: _spawn(
                     spa.toggle_light(ix) if v == "toggle"
                     else spa.set_light(ix, v == "true")
                 ),
@@ -508,7 +556,7 @@ class MQTTBridge:
                 value=status.aux[i],
                 settable=True,
                 hass_component="switch",
-                on_set=lambda v, ix=idx: asyncio.create_task(
+                on_set=lambda v, ix=idx: _spawn(
                     spa.toggle_aux(ix) if v == "toggle"
                     else spa.set_aux(ix, v == "true")
                 ),
@@ -521,7 +569,7 @@ class MQTTBridge:
             format="normal_operation,clear_notification,soak",
             hass_component="button",
             hass_extra={"payload_press": "normal_operation"},
-            on_set=lambda v: asyncio.create_task(spa.toggle_item(v)),
+            on_set=lambda v: _spawn(spa.toggle_item(v)),
         ))
 
         # ---- filter cycle nodes ----
@@ -552,7 +600,7 @@ class MQTTBridge:
                 unit="hours", format="0:23",
                 hass_component="number",
                 hass_extra={"icon": "mdi:clock"},
-                on_set=lambda v, c=cn: asyncio.create_task(
+                on_set=lambda v, c=cn: _spawn(
                     _update_filter_cycle(spa, c, "start_hour", int(v))
                 ),
             ))
@@ -562,7 +610,7 @@ class MQTTBridge:
                 unit="minutes", format="0:59",
                 hass_component="number",
                 hass_extra={"icon": "mdi:clock"},
-                on_set=lambda v, c=cn: asyncio.create_task(
+                on_set=lambda v, c=cn: _spawn(
                     _update_filter_cycle(spa, c, "start_minute", int(v))
                 ),
             ))
@@ -572,7 +620,7 @@ class MQTTBridge:
                 unit="minutes", format="0:1439",
                 hass_component="number",
                 hass_extra={"icon": "mdi:clock"},
-                on_set=lambda v, c=cn: asyncio.create_task(
+                on_set=lambda v, c=cn: _spawn(
                     _update_filter_cycle(spa, c, "duration", int(v))
                 ),
             ))
@@ -583,7 +631,7 @@ class MQTTBridge:
                     value=enabled, settable=True,
                     hass_component="switch",
                     hass_extra={"icon": "mdi:filter-check"},
-                    on_set=lambda v: asyncio.create_task(
+                    on_set=lambda v: _spawn(
                         _update_filter_cycle(spa, 2, "enabled", v == "true")
                     ),
                 ))
@@ -594,28 +642,31 @@ class MQTTBridge:
     # Main loop
     # ------------------------------------------------------------------
 
-    async def _connect_spa(self, retry_delay: int = 300) -> None:
-        """Connect (or reconnect) to the spa, retrying every *retry_delay* seconds on failure."""
+    async def _connect_spa(self, min_delay: float = 5, max_delay: float = 300) -> None:
+        """Connect (or reconnect) to the spa and wait for its full configuration.
+
+        Retries forever with exponential backoff (*min_delay* … *max_delay* s).
+        """
         spa = self.spa
+        delay = min_delay
         while True:
             try:
                 await spa.connect()
                 await spa.request_configuration()
                 await spa.request_filter_configuration()
+                await self._wait_for_configuration()
                 return
-            except Exception as exc:
-                logger.error(
-                    "Failed to connect to spa: %s — retrying in %ds", exc, retry_delay
-                )
-                await asyncio.sleep(retry_delay)
+            except (ConnectionError, OSError) as exc:
+                logger.error("Failed to connect to spa: %s — retrying in %.0fs", exc, delay)
+                await spa.close()
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, max_delay)
 
-    async def run(self) -> None:
+    async def _wait_for_configuration(self) -> None:
         spa = self.spa
-
-        await self._connect_spa()
-
-        # Wait for full configuration
         logger.info("Waiting for full spa configuration…")
+        # Require a fresh status after (re)connecting, not a cached one.
+        spa.status = None
         while not spa.full_configuration:
             message = await spa.poll()
             if isinstance(message, msgs.Status):
@@ -625,8 +676,12 @@ class MQTTBridge:
                     await spa.request_control_info2()
                 if not spa.filter_cycles:
                     await spa.request_filter_configuration()
-
         logger.info("Full configuration received. Model: %s", spa.model)
+
+    async def run(self) -> None:
+        """Run one MQTT session. Raises aiomqtt.MqttError when MQTT drops."""
+        await self._connect_spa()
+        _touch_heartbeat()
 
         self.homie = self._make_homie()
         await self.homie.publish_structure()
@@ -635,45 +690,59 @@ class MQTTBridge:
 
         logger.info("BWA MQTT bridge running (version %s)", VERSION)
 
-        # Concurrently: poll spa and handle incoming MQTT commands
-        await asyncio.gather(
-            self._spa_loop(),
-            self._mqtt_loop(),
-        )
+        # Concurrently poll spa and handle incoming MQTT commands. TaskGroup
+        # cancels the sibling if one fails (gather would leave it running).
+        try:
+            async with asyncio.TaskGroup() as tg:
+                tg.create_task(self._spa_loop())
+                tg.create_task(self._mqtt_loop())
+        except* aiomqtt.MqttError as eg:
+            raise eg.exceptions[0] from None
 
     async def _spa_loop(self) -> None:
         """Continuously poll the spa and push updates to MQTT."""
         spa = self.spa
         homie = self.homie
         assert homie is not None
+        last_beat = 0.0
 
         while True:
             try:
                 message = await spa.poll()
+
+                if isinstance(message, msgs.Status):
+                    now_mono = time.monotonic()
+                    if now_mono - last_beat >= HEARTBEAT_INTERVAL:
+                        _touch_heartbeat()
+                        last_beat = now_mono
+
+                    await self._publish_status(message)
+                    await self._sync_clock(message)
+
+                elif isinstance(message, msgs.FilterCycles):
+                    await self._publish_filter_cycles(message)
+
             except ConnectionError as exc:
-                logger.error("Spa connection lost: %s", exc)
+                logger.error("Spa connection lost: %s — reconnecting", exc)
+                await homie.publish_state("alert")
                 await self._connect_spa()
-                continue
+                await homie.publish_state("ready")
+                logger.info("Spa connection restored")
 
-            if isinstance(message, msgs.Status):
-                await self._publish_status(message)
-
-                # Keep spa clock in sync (allow 1 min skew)
-                import datetime
-                now = datetime.datetime.now()
-                spa_min = message.hour * 60 + message.minute
-                now_min = now.hour * 60 + now.minute
-                diff = min(abs(spa_min - now_min), 1440 - abs(spa_min - now_min))
-                if diff > 1:
-                    logger.info(
-                        "Spa time %02d:%02d, local %02d:%02d — correcting",
-                        message.hour, message.minute, now.hour, now.minute,
-                    )
-                    await spa.set_time(now.hour, now.minute,
-                                       twenty_four_hour_time=message.twenty_four_hour_time)
-
-            elif isinstance(message, msgs.FilterCycles):
-                await self._publish_filter_cycles(message)
+    async def _sync_clock(self, status: msgs.Status) -> None:
+        """Keep spa clock in sync with local time (allow 1 min skew)."""
+        import datetime
+        now = datetime.datetime.now()
+        spa_min = status.hour * 60 + status.minute
+        now_min = now.hour * 60 + now.minute
+        diff = min(abs(spa_min - now_min), 1440 - abs(spa_min - now_min))
+        if diff > 1:
+            logger.info(
+                "Spa time %02d:%02d, local %02d:%02d — correcting",
+                status.hour, status.minute, now.hour, now.minute,
+            )
+            await self.spa.set_time(now.hour, now.minute,
+                                    twenty_four_hour_time=status.twenty_four_hour_time)
 
     async def _mqtt_loop(self) -> None:
         """Handle incoming MQTT /set commands."""
@@ -833,22 +902,30 @@ async def main() -> None:
         qos=1,
     )
 
-    logger.info("Connecting to MQTT broker at %s:%s", mqtt_host, mqtt_port)
-    async with aiomqtt.Client(
-        hostname=mqtt_host,
-        port=mqtt_port,
-        username=mqtt_user,
-        password=mqtt_pass,
-        will=will,
-        keepalive=60,
-    ) as mqtt_client:
-        bridge = MQTTBridge(
-            spa=spa,
-            mqtt=mqtt_client,
-            device_id=args.device_id,
-            root_topic=args.root_topic,
-        )
-        await bridge.run()
+    delay = 5.0
+    while True:
+        logger.info("Connecting to MQTT broker at %s:%s", mqtt_host, mqtt_port)
+        try:
+            async with aiomqtt.Client(
+                hostname=mqtt_host,
+                port=mqtt_port,
+                username=mqtt_user,
+                password=mqtt_pass,
+                will=will,
+                keepalive=60,
+            ) as mqtt_client:
+                delay = 5.0
+                bridge = MQTTBridge(
+                    spa=spa,
+                    mqtt=mqtt_client,
+                    device_id=args.device_id,
+                    root_topic=args.root_topic,
+                )
+                await bridge.run()
+        except aiomqtt.MqttError as exc:
+            logger.error("MQTT connection lost: %s — reconnecting in %.0fs", exc, delay)
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 120.0)
 
 
 if __name__ == "__main__":

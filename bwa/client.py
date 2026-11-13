@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import socket
 from typing import Optional
 from urllib.parse import urlparse
 
@@ -23,10 +24,25 @@ logger = logging.getLogger("bwa.client")
 
 HEATING_MODES = ("ready", "rest", "ready_in_rest")
 
+# The spa sends a status update several times per second. If nothing at all
+# arrives for this long, the connection is considered dead (WiFi/RS-485
+# adapters are known to stall a TCP session without ever closing it).
+DEFAULT_READ_TIMEOUT = 30.0
+CONNECT_TIMEOUT = 10.0
+
+
+def _enable_tcp_keepalive(sock: socket.socket) -> None:
+    """Make the kernel detect a dead peer within ~1 minute."""
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    for opt, val in (("TCP_KEEPIDLE", 20), ("TCP_KEEPINTVL", 10), ("TCP_KEEPCNT", 3)):
+        if hasattr(socket, opt):
+            sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, opt), val)
+
 
 class BWAClient:
-    def __init__(self, uri: str):
+    def __init__(self, uri: str, read_timeout: float = DEFAULT_READ_TIMEOUT):
         self._uri = uri
+        self._read_timeout = read_timeout
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
         self._buffer = bytearray()
@@ -43,13 +59,35 @@ class BWAClient:
     # Connection
     # ------------------------------------------------------------------
 
+    async def close(self) -> None:
+        """Close the current connection (if any) and drop buffered state."""
+        writer, self._writer, self._reader = self._writer, None, None
+        self._buffer.clear()
+        while not self._send_queue.empty():
+            self._send_queue.get_nowait()
+        if writer is not None:
+            writer.close()
+            try:
+                await asyncio.wait_for(writer.wait_closed(), timeout=5)
+            except Exception:  # noqa: BLE001 — best effort, peer may be gone
+                pass
+
     async def connect(self) -> None:
+        await self.close()
         parsed = urlparse(self._uri)
 
         if parsed.scheme == "tcp":
             host = parsed.hostname
             port = parsed.port or 4257
-            self._reader, self._writer = await asyncio.open_connection(host, port)
+            try:
+                self._reader, self._writer = await asyncio.wait_for(
+                    asyncio.open_connection(host, port), timeout=CONNECT_TIMEOUT
+                )
+            except asyncio.TimeoutError as exc:
+                raise ConnectionError(f"Timed out connecting to {host}:{port}") from exc
+            sock = self._writer.get_extra_info("socket")
+            if sock is not None:
+                _enable_tcp_keepalive(sock)
             self._is_serial = False
             logger.info("Connected to %s:%s via TCP", host, port)
 
@@ -131,13 +169,21 @@ class BWAClient:
                 del self._buffer[:consumed]
 
             # Need more data
+            if self._reader is None:
+                raise ConnectionError("Not connected to spa")
             try:
-                chunk = await self._reader.read(4096)
-                if not chunk:
-                    raise ConnectionError("Spa connection closed (EOF)")
-                self._buffer.extend(chunk)
-            except (ConnectionResetError, OSError) as exc:
+                chunk = await asyncio.wait_for(
+                    self._reader.read(4096), timeout=self._read_timeout
+                )
+            except asyncio.TimeoutError as exc:
+                raise ConnectionError(
+                    f"No data from spa for {self._read_timeout:.0f}s — connection stalled"
+                ) from exc
+            except OSError as exc:
                 raise ConnectionError(f"Spa connection error: {exc}") from exc
+            if not chunk:
+                raise ConnectionError("Spa connection closed (EOF)")
+            self._buffer.extend(chunk)
 
     async def _send(self, message: Message) -> None:
         message.src = 0x0A
@@ -146,9 +192,14 @@ class BWAClient:
         logger.info("to spa: %s", message)
         if self._is_serial:
             await self._send_queue.put(raw)
-        else:
+            return
+        if self._writer is None or self._writer.is_closing():
+            raise ConnectionError("Not connected to spa")
+        try:
             self._writer.write(raw)
-            await self._writer.drain()
+            await asyncio.wait_for(self._writer.drain(), timeout=self._read_timeout)
+        except (OSError, asyncio.TimeoutError) as exc:
+            raise ConnectionError(f"Failed to send to spa: {exc}") from exc
 
     # ------------------------------------------------------------------
     # Configuration requests
