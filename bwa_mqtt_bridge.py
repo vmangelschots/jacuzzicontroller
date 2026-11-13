@@ -41,7 +41,7 @@ from bwa import messages as msgs
 
 logger = logging.getLogger("bwa_mqtt_bridge")
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 
 # Touched whenever a status arrives from the spa; a k8s liveness probe can
 # check its age. Empty string disables it.
@@ -88,6 +88,7 @@ class HomieDevice:
         self.mqtt = mqtt
         self.root = root
         self.nodes: dict[str, HomieNode] = {}
+        self.state = "init"   # the $state this bridge currently asserts
         self.hass_device = hass_device or {}
 
     @property
@@ -107,7 +108,7 @@ class HomieDevice:
         base = self.base
         await self.publish(f"{base}/$homie", "4.0.0")
         await self.publish(f"{base}/$name", self.name)
-        await self.publish(f"{base}/$state", "init")
+        await self.publish_state("init")
         await self.publish(f"{base}/$nodes", ",".join(self.nodes))
 
         for node in self.nodes.values():
@@ -129,7 +130,7 @@ class HomieDevice:
                 if prop.value is not None:
                     await self.publish_value(node.node_id, prop.prop_id, prop.value)
 
-        await self.publish(f"{base}/$state", "ready")
+        await self.publish_state("ready")
 
     async def publish_value(self, node_id: str, prop_id: str, value: Any) -> None:
         prop = self.nodes[node_id].properties[prop_id]
@@ -138,8 +139,23 @@ class HomieDevice:
         payload = _encode_value(value, prop.datatype)
         await self.publish(topic, payload)
 
+    @property
+    def state_topic(self) -> str:
+        return f"{self.base}/$state"
+
     async def subscribe_settable(self) -> None:
         await self.mqtt.subscribe(f"{self.base}/+/+/set", qos=1)
+        # Watch our own $state: a stale last-will ("lost") from a previous
+        # session, or another client, must not leave HA showing unavailable.
+        await self.mqtt.subscribe(self.state_topic, qos=1)
+
+    async def handle_state(self, payload: str) -> None:
+        if payload != self.state:
+            logger.warning(
+                "%s is %r but bridge is %r — republishing",
+                self.state_topic, payload, self.state,
+            )
+            await self.publish_state(self.state)
 
     async def handle_set(self, topic: str, payload: str) -> None:
         """Route an incoming /set message to the correct property callback."""
@@ -162,7 +178,8 @@ class HomieDevice:
             logger.exception("Failed to handle set %s/%s = %r", node_id, prop_id, payload)
 
     async def publish_state(self, state: str) -> None:
-        await self.publish(f"{self.base}/$state", state)
+        self.state = state
+        await self.publish(self.state_topic, state)
 
     # ------------------------------------------------------------------
     # Home Assistant discovery helpers
@@ -745,11 +762,16 @@ class MQTTBridge:
                                     twenty_four_hour_time=status.twenty_four_hour_time)
 
     async def _mqtt_loop(self) -> None:
-        """Handle incoming MQTT /set commands."""
+        """Handle incoming MQTT /set commands and guard our $state."""
         homie = self.homie
         assert homie is not None
         async for message in self.mqtt.messages:
-            await homie.handle_set(str(message.topic), message.payload.decode())
+            topic = str(message.topic)
+            payload = message.payload.decode(errors="replace")
+            if topic == homie.state_topic:
+                await homie.handle_state(payload)
+            else:
+                await homie.handle_set(topic, payload)
 
     async def _publish_status(self, status: msgs.Status) -> None:
         homie = self.homie
@@ -913,6 +935,9 @@ async def main() -> None:
                 password=mqtt_pass,
                 will=will,
                 keepalive=60,
+                # Stable ID: on reconnect the broker drops the old session
+                # (and fires its will) *before* we publish "ready" again.
+                identifier=f"bwa-bridge-{args.device_id}",
             ) as mqtt_client:
                 delay = 5.0
                 bridge = MQTTBridge(
